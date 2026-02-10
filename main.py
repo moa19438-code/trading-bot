@@ -1,6 +1,7 @@
 import os
 import json
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 
@@ -56,7 +57,7 @@ RUN_KEY = getenv_any(["RUN_KEY", "SCAN_KEY", "CRON_KEY", "JOB_KEY"], "")
 # Telegram webhook secret (for /tg endpoint)
 TELEGRAM_WEBHOOK_SECRET = getenv_any(["TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"], "").strip()
 
-# Scanner settings
+# Scanner settings (legacy - still used in /scan)
 STOP_LOSS_PCT = getenv_float_any(["STOP_LOSS_PCT", "SL_PCT"], 3)
 TAKE_PROFIT_PCT = getenv_float_any(["TAKE_PROFIT_PCT", "TP_PCT"], 5)
 MAX_RESULTS = getenv_int_any(["MAX_RESULTS", "MAX_PICKS"], 7)
@@ -64,13 +65,18 @@ MIN_PRICE = getenv_float_any(["MIN_PRICE"], 2)
 MAX_PRICE = getenv_float_any(["MAX_PRICE"], 300)
 MIN_AVG_VOL = getenv_int_any(["MIN_AVG_VOL", "MIN_VOLUME"], 1_500_000)
 
+# Cooldown minutes for duplicate alerts (TradingView)
+ALERT_COOLDOWN_MIN = getenv_int_any(["ALERT_COOLDOWN_MIN"], 60)
+
 _state = {"day_key": None, "sent_symbols": set()}
 
 # Settings persistence (capital, risk, side...)
 DEFAULT_SETTINGS = {
     "capital": 10000.0,
     "risk_pct": 1.0,    # %
-    "side": "both"      # long / short / both
+    "side": "both",     # long / short / both
+    "filter_mode": "enter_only",  # enter_only | enter_wait
+    "cooldown_min": ALERT_COOLDOWN_MIN
 }
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
 _settings_cache = None
@@ -114,10 +120,6 @@ except Exception:
 
 # ================= Telegram sendMessage =================
 def send_telegram(text: str, chat_id: str | None = None):
-    """
-    يرسل للقناة/الجروب الافتراضي TELEGRAM_CHAT_ID.
-    تقدر تمرر chat_id للرد على الخاص مثلًا.
-    """
     if not TELEGRAM_BOT_TOKEN:
         return False, "Missing TELEGRAM_BOT_TOKEN"
 
@@ -176,6 +178,175 @@ def load_universe():
         pass
     return list(dict.fromkeys(tickers))
 
+# ================= Indicators (for /analyze) =================
+def sma(values, n):
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
+
+def rsi_14(closes):
+    if len(closes) < 15:
+        return None
+    gains = []
+    losses = []
+    for i in range(-14, 0):
+        diff = closes[i] - closes[i-1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-diff)
+    avg_gain = sum(gains) / 14.0
+    avg_loss = sum(losses) / 14.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def atr_14(highs, lows, closes):
+    if len(closes) < 15 or len(highs) < 15 or len(lows) < 15:
+        return None
+    trs = []
+    for i in range(-14, 0):
+        h = highs[i]
+        l = lows[i]
+        prev_c = closes[i-1]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+    return sum(trs) / 14.0
+
+def compute_position_size(capital, risk_pct, entry, sl):
+    risk_dollars = float(capital) * (float(risk_pct) / 100.0)
+    per_share = abs(float(entry) - float(sl))
+    if per_share <= 0:
+        return 0
+    return max(int(risk_dollars / per_share), 0)
+
+def analyze_symbol(symbol: str):
+    if yf is None:
+        return {"ok": False, "error": "yfinance not installed"}
+
+    symbol = symbol.strip().upper()
+    try:
+        df = yf.download(symbol, period="6mo", interval="1d", auto_adjust=True, progress=False)
+    except Exception as e:
+        return {"ok": False, "error": f"download failed: {e}"}
+
+    if df is None or df.empty or len(df) < 60:
+        return {"ok": False, "error": "not enough data"}
+
+    closes = [float(x) for x in df["Close"].dropna().tolist()]
+    highs  = [float(x) for x in df["High"].dropna().tolist()]
+    lows   = [float(x) for x in df["Low"].dropna().tolist()]
+
+    entry = closes[-1]
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50)
+    rsi = rsi_14(closes)
+    atr = atr_14(highs, lows, closes)
+
+    if ma20 is None or ma50 is None or rsi is None or atr is None:
+        return {"ok": False, "error": "indicator calc failed"}
+
+    trend = "up" if entry > ma50 and ma20 > ma50 else ("down" if entry < ma50 and ma20 < ma50 else "neutral")
+
+    last20 = closes[-21:-1]
+    breakout_up = entry > max(last20) if len(last20) >= 20 else False
+    breakout_down = entry < min(last20) if len(last20) >= 20 else False
+
+    s = load_settings()
+    capital = float(s.get("capital", 10000.0))
+    risk_pct = float(s.get("risk_pct", 1.0))
+    side = str(s.get("side", "both")).lower()
+
+    sl_mult = 1.5
+    tp1_mult = 1.5
+    tp2_mult = 3.0
+
+    ideas = []
+
+    # LONG
+    if side in ("both", "long"):
+        sl = entry - sl_mult * atr
+        tp1 = entry + tp1_mult * atr
+        tp2 = entry + tp2_mult * atr
+        qty = compute_position_size(capital, risk_pct, entry, sl)
+
+        score = 0
+        reasons = []
+        if trend == "up":
+            score += 3; reasons.append("Trend up")
+        if breakout_up:
+            score += 3; reasons.append("Breakout 20D")
+        if 50 <= rsi <= 72:
+            score += 2; reasons.append("RSI 50-72")
+        if rsi > 72:
+            reasons.append("RSI high (pullback risk)")
+        if trend == "down":
+            reasons.append("Trend down (weak long)")
+
+        decision = "ENTER" if score >= 6 else ("WAIT" if score >= 4 else "SKIP")
+
+        ideas.append({
+            "side": "LONG",
+            "decision": decision,
+            "score": score,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "qty": qty,
+            "reasons": reasons
+        })
+
+    # SHORT
+    if side in ("both", "short"):
+        sl = entry + sl_mult * atr
+        tp1 = entry - tp1_mult * atr
+        tp2 = entry - tp2_mult * atr
+        qty = compute_position_size(capital, risk_pct, entry, sl)
+
+        score = 0
+        reasons = []
+        if trend == "down":
+            score += 3; reasons.append("Trend down")
+        if breakout_down:
+            score += 3; reasons.append("Breakdown 20D")
+        if 28 <= rsi <= 50:
+            score += 2; reasons.append("RSI 28-50")
+        if rsi < 28:
+            reasons.append("RSI very low (bounce risk)")
+        if trend == "up":
+            reasons.append("Trend up (weak short)")
+
+        decision = "ENTER" if score >= 6 else ("WAIT" if score >= 4 else "SKIP")
+
+        ideas.append({
+            "side": "SHORT",
+            "decision": decision,
+            "score": score,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "qty": qty,
+            "reasons": reasons
+        })
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "entry": entry,
+        "trend": trend,
+        "ma20": ma20,
+        "ma50": ma50,
+        "rsi": rsi,
+        "atr": atr,
+        "ideas": ideas
+    }
+
+# ================= Scanner (legacy) =================
 def scan_universe(tickers):
     if yf is None:
         return [], "yfinance not installed"
@@ -242,6 +413,9 @@ def scan_universe(tickers):
 tg_app = None
 _tg_initialized = False
 
+# in-memory cooldown map { "AAPL|BUY": iso_datetime }
+_last_alert_ts = {}
+
 def _ensure_tg_initialized():
     global _tg_initialized
     if tg_app and not _tg_initialized:
@@ -252,9 +426,6 @@ if TELEGRAM_BOT_TOKEN:
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 def _is_admin(update: Update) -> bool:
-    """
-    التحكم بالأوامر من الخاص لحساب ADMIN_USER_ID فقط.
-    """
     try:
         if not ADMIN_USER_ID:
             return True
@@ -265,7 +436,8 @@ def _is_admin(update: Update) -> bool:
 def _menu():
     s = load_settings()
     kb = [
-        [InlineKeyboardButton("📊 Scan الآن", callback_data="scanrun")],
+        [InlineKeyboardButton("📊 Scan الآن (أرسل للقناة)", callback_data="scanrun")],
+        [InlineKeyboardButton("🧠 Analyze سهم", callback_data="help_analyze")],
         [InlineKeyboardButton("💰 Capital +1000", callback_data="cap_plus"),
          InlineKeyboardButton("💰 Capital -1000", callback_data="cap_minus")],
         [InlineKeyboardButton("⚠️ Risk +0.25%", callback_data="risk_plus"),
@@ -273,9 +445,16 @@ def _menu():
         [InlineKeyboardButton("📈 Long", callback_data="side_long"),
          InlineKeyboardButton("📉 Short", callback_data="side_short"),
          InlineKeyboardButton("🔁 Both", callback_data="side_both")],
+        [InlineKeyboardButton("🔔 Filter: ENTER فقط", callback_data="filter_enter_only"),
+         InlineKeyboardButton("🔔 ENTER+WAIT", callback_data="filter_enter_wait")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="show_settings")]
     ]
-    text = f"⚙️ Settings\nCapital: {s['capital']}$ | Risk: {s['risk_pct']}% | Side: {s['side']}"
+    text = (
+        "⚙️ Settings\n"
+        f"Capital: {s['capital']}$ | Risk: {s['risk_pct']}% | Side: {s['side']}\n"
+        f"TV Filter: {s.get('filter_mode','enter_only')} | Cooldown: {s.get('cooldown_min',60)}m\n"
+        "أوامر: /analyze AAPL | /capital 25000 | /risk 1 | /scanrun"
+    )
     return text, InlineKeyboardMarkup(kb)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -283,6 +462,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⛔ غير مصرح.")
     text, markup = _menu()
     await update.message.reply_text(text, reply_markup=markup)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await update.message.reply_text("⛔ غير مصرح.")
+    await update.message.reply_text(
+        "✅ الأوامر:\n"
+        "/start\n"
+        "/analyze AAPL\n"
+        "/scanrun (يرسل للقناة)\n"
+        "/capital 25000\n"
+        "/risk 1\n"
+        "/status\n"
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await update.message.reply_text("⛔ غير مصرح.")
+    s = load_settings()
+    await update.message.reply_text(
+        "📌 Status\n"
+        f"Market open: {market_open_now_et()}\n"
+        f"Capital: {s['capital']}$ | Risk: {s['risk_pct']}% | Side: {s['side']}\n"
+        f"TV Filter: {s.get('filter_mode','enter_only')} | Cooldown: {s.get('cooldown_min',60)}m\n"
+        f"Universe size: {len(load_universe())}\n"
+    )
 
 async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -311,7 +515,6 @@ async def cmd_scanrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⛔ غير مصرح.")
 
     reset_day()
-
     if not market_open_now_et():
         return await update.message.reply_text("ℹ️ السوق مغلق الآن (America/New_York).")
 
@@ -323,14 +526,57 @@ async def cmd_scanrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not picks:
         return await update.message.reply_text("ما فيه فرص حالياً.")
 
-    lines = [f"📈 فرص اليوم (SL {STOP_LOSS_PCT}% | TP {TAKE_PROFIT_PCT}%):"]
+    lines = [f"📈 فرص اليوم (Legacy Scan) (SL {STOP_LOSS_PCT}% | TP {TAKE_PROFIT_PCT}%):"]
     for p in picks[:MAX_RESULTS]:
         lines.append(f"- {p['symbol']} | Entry {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}")
 
-    # نرسل النتائج للقناة
     ok, info = send_telegram("\n".join(lines))
-    # ونرد عليك بالخاص بتأكيد
     await update.message.reply_text(f"✅ تم الإرسال للقناة.\n({info})")
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await update.message.reply_text("⛔ غير مصرح.")
+    if not context.args:
+        return await update.message.reply_text("استخدم: /analyze AAPL")
+
+    sym = context.args[0].upper()
+    res = analyze_symbol(sym)
+    if not res.get("ok"):
+        return await update.message.reply_text(f"⚠️ خطأ: {res.get('error')}")
+
+    s = load_settings()
+    lines = []
+    lines.append(f"🧠 Analyze {res['symbol']} (Swing)")
+    lines.append(f"Entry: {res['entry']:.2f}")
+    lines.append(f"Trend: {res['trend']} | MA20 {res['ma20']:.2f} | MA50 {res['ma50']:.2f}")
+    lines.append(f"RSI(14): {res['rsi']:.1f} | ATR(14): {res['atr']:.2f}")
+    lines.append(f"Capital: {s['capital']}$ | Risk: {s['risk_pct']}% | Side: {s['side']}")
+    lines.append("—")
+
+    for idea in res["ideas"]:
+        emoji = "✅" if idea["decision"] == "ENTER" else ("⚠️" if idea["decision"] == "WAIT" else "⛔")
+        lines.append(f"{emoji} {idea['side']} | {idea['decision']} | Score {idea['score']}/8")
+        lines.append(f"SL: {idea['sl']:.2f} | TP1: {idea['tp1']:.2f} | TP2: {idea['tp2']:.2f}")
+        lines.append(f"Qty (risk-based): {idea['qty']}")
+        if idea["reasons"]:
+            lines.append("• " + " | ".join(idea["reasons"]))
+        lines.append("—")
+
+    await update.message.reply_text("\n".join(lines))
+
+def _cooldown_ok(symbol: str, direction: str) -> bool:
+    s = load_settings()
+    cooldown_min = int(s.get("cooldown_min", ALERT_COOLDOWN_MIN))
+    key = f"{symbol}|{direction}".upper()
+    now = datetime.utcnow()
+    last = _last_alert_ts.get(key)
+    if last is None:
+        _last_alert_ts[key] = now
+        return True
+    if (now - last) >= timedelta(minutes=cooldown_min):
+        _last_alert_ts[key] = now
+        return True
+    return False
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -341,10 +587,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = load_settings()
     data = q.data
 
+    if data == "help_analyze":
+        text, markup = _menu()
+        return await q.edit_message_text("اكتب: /analyze AAPL (في الخاص)\nثم راح يعطيك قرار + SL/TP ATR + كمية.", reply_markup=markup)
+
     if data == "scanrun":
-        await q.edit_message_text("⏳ جاري تشغيل السكان... اكتب /scanrun لو تبغى.", reply_markup=_menu()[1])
-        # ملاحظة: تشغيل scanrun الحقيقي يتم بالأمر /scanrun (لتجنب تعقيد async هنا)
-        return
+        text, markup = _menu()
+        return await q.edit_message_text("لتشغيل Scan وإرساله للقناة اكتب: /scanrun", reply_markup=markup)
 
     if data == "cap_plus":
         s["capital"] = float(s["capital"]) + 1000.0
@@ -360,6 +609,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s["side"] = "short"
     elif data == "side_both":
         s["side"] = "both"
+    elif data == "filter_enter_only":
+        s["filter_mode"] = "enter_only"
+    elif data == "filter_enter_wait":
+        s["filter_mode"] = "enter_wait"
     elif data == "show_settings":
         text, markup = _menu()
         return await q.edit_message_text(text, reply_markup=markup)
@@ -370,9 +623,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if tg_app:
     tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("capital", cmd_capital))
     tg_app.add_handler(CommandHandler("risk", cmd_risk))
     tg_app.add_handler(CommandHandler("scanrun", cmd_scanrun))
+    tg_app.add_handler(CommandHandler("analyze", cmd_analyze))
     tg_app.add_handler(CallbackQueryHandler(on_button))
 
 @app.post("/tg")
@@ -414,17 +670,64 @@ def handle_tradingview(payload: dict):
     ticker = payload.get("ticker") or payload.get("symbol") or payload.get("s") or payload.get("tv_ticker") or "UNKNOWN"
     price = payload.get("price") or payload.get("close") or payload.get("last") or payload.get("p") or ""
     tf = payload.get("tf") or payload.get("timeframe") or payload.get("interval") or payload.get("i") or ""
-    direction = payload.get("direction") or payload.get("action") or payload.get("side") or payload.get("d") or "SIGNAL"
+    direction = (payload.get("direction") or payload.get("action") or payload.get("side") or payload.get("d") or "SIGNAL")
     reason = payload.get("reason") or payload.get("message") or payload.get("r") or "TV Alert"
 
+    # ---- Pro filter (analyze + cooldown) ----
+    # Normalize direction
+    dir_norm = str(direction).upper()
+    if dir_norm in ("BUY", "LONG"):
+        dir_norm = "BUY"
+    elif dir_norm in ("SELL", "SHORT"):
+        dir_norm = "SELL"
+    else:
+        # keep SIGNAL
+        dir_norm = dir_norm
+
+    # cooldown (only for BUY/SELL)
+    if dir_norm in ("BUY", "SELL"):
+        if not _cooldown_ok(ticker, dir_norm):
+            return jsonify({"ok": True, "ignored": "cooldown"}), 200
+
+    # analyze and decide (only for BUY/SELL)
+    s = load_settings()
+    filter_mode = s.get("filter_mode", "enter_only")
+
+    decision_note = ""
+    if dir_norm in ("BUY", "SELL"):
+        res = analyze_symbol(ticker)
+        if res.get("ok"):
+            # choose idea based on BUY/SELL
+            want_side = "LONG" if dir_norm == "BUY" else "SHORT"
+            idea = next((x for x in res["ideas"] if x["side"] == want_side), None)
+            if idea:
+                decision_note = f"{idea['decision']} | Score {idea['score']}/8 | SL {idea['sl']:.2f} TP1 {idea['tp1']:.2f} TP2 {idea['tp2']:.2f} Qty {idea['qty']}"
+                if filter_mode == "enter_only" and idea["decision"] != "ENTER":
+                    # don't spam channel, but tell admin in private
+                    send_telegram(
+                        f"⛔ Filtered TV Alert ({want_side})\n{ticker} {tf}\nDecision: {idea['decision']}\n{decision_note}\nReason: {reason}",
+                        chat_id=ADMIN_USER_ID if ADMIN_USER_ID else None
+                    )
+                    return jsonify({"ok": True, "filtered": idea["decision"]}), 200
+
+                if filter_mode == "enter_wait" and idea["decision"] == "SKIP":
+                    send_telegram(
+                        f"⛔ Filtered TV Alert ({want_side})\n{ticker} {tf}\nDecision: SKIP\n{decision_note}\nReason: {reason}",
+                        chat_id=ADMIN_USER_ID if ADMIN_USER_ID else None
+                    )
+                    return jsonify({"ok": True, "filtered": "SKIP"}), 200
+
+    # ---- Send to channel ----
     msg = (
-        "📣 تنبيه TradingView\n"
-        f"السهم: {ticker}\n"
-        f"الفريم: {tf}\n"
-        f"الاتجاه: {direction}\n"
-        f"السعر: {price}\n"
-        f"السبب: {reason}\n"
+        "📣 TradingView Alert\n"
+        f"Ticker: {ticker}\n"
+        f"TF: {tf}\n"
+        f"Direction: {dir_norm}\n"
+        f"Price: {price}\n"
+        f"Reason: {reason}\n"
     )
+    if decision_note:
+        msg += f"—\n🧠 Analyze: {decision_note}\n"
 
     ok, info = send_telegram(msg)
     return jsonify({"ok": ok, "info": info, "received": payload}), (200 if ok else 500)
@@ -478,7 +781,7 @@ def scan():
     if not fresh:
         return jsonify({"ok": True, "message": "no new symbols"}), 200
 
-    lines = [f"📌 Market Picks (SL {STOP_LOSS_PCT}% | TP {TAKE_PROFIT_PCT}%)", f"Count: {len(fresh)}", "—"]
+    lines = [f"📌 Market Picks (Legacy Scan) (SL {STOP_LOSS_PCT}% | TP {TAKE_PROFIT_PCT}%)", f"Count: {len(fresh)}", "—"]
     for i, p in enumerate(fresh, 1):
         lines.append(
             f"{i}) {p['symbol']} | Daily: {p['chg_pct']}% | AvgVol: {p['avg_vol']}\n"
