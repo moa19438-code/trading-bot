@@ -207,41 +207,104 @@ def test():
     ok, info = send_telegram("✅ Test / اختبار: البوت شغال ويرسل تيليجرام بنجاح\nBot is running and Telegram works.")
     return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
 
-# ============ TradingView webhooks (/webhook و /tv) ============
+# ===== TradingView Webhooks (replace old handle_tradingview + webhook + tv) =====
+
 def handle_tradingview(payload: dict):
-    # تحقق من السر
+    # ✅ تحقق من السر (secret)
     if WEBHOOK_SECRET:
         incoming = str(payload.get("secret", "")).strip()
         if incoming != WEBHOOK_SECRET:
+            print("BAD SECRET:", incoming)
             return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    ticker = payload.get("ticker") or payload.get("symbol") or "UNKNOWN"
-    price = payload.get("price") or payload.get("close") or payload.get("last") or ""
-    tf = payload.get("tf") or payload.get("timeframe") or payload.get("interval") or ""
-    direction = payload.get("direction") or payload.get("action") or "SIGNAL"
-    reason = payload.get("reason") or payload.get("message") or "TradingView Alert"
+    # ✅ دعم أسماء متغيرات مختلفة (TradingView / أدوات اختبار)
+    ticker = (
+        payload.get("ticker")
+        or payload.get("symbol")
+        or payload.get("s")
+        or payload.get("tv_ticker")
+        or "UNKNOWN"
+    )
 
+    price = (
+        payload.get("price")
+        or payload.get("close")
+        or payload.get("last")
+        or payload.get("p")
+        or ""
+    )
+
+    tf = (
+        payload.get("tf")
+        or payload.get("timeframe")
+        or payload.get("interval")
+        or payload.get("i")
+        or ""
+    )
+
+    direction = (
+        payload.get("direction")
+        or payload.get("action")
+        or payload.get("side")
+        or payload.get("d")
+        or "SIGNAL"
+    )
+
+    reason = (
+        payload.get("reason")
+        or payload.get("message")
+        or payload.get("r")
+        or "TV Alert"
+    )
+
+    # ✅ رسالة عربي + إنجليزي
     msg = (
-        "📣 تنبيه TradingView / TradingView Alert\n"
-        f"السهم / Ticker: {ticker}\n"
-        f"الفريم / TF: {tf}\n"
-        f"الاتجاه / Direction: {direction}\n"
-        f"السعر / Price: {price}\n"
-        f"السبب / Reason: {reason}"
+        "📣 تنبيه TradingView\n"
+        f"السهم: {ticker}\n"
+        f"الفريم: {tf}\n"
+        f"الاتجاه: {direction}\n"
+        f"السعر: {price}\n"
+        f"السبب: {reason}\n"
+        "—\n"
+        "📣 TradingView Alert\n"
+        f"Ticker: {ticker}\n"
+        f"TF: {tf}\n"
+        f"Direction: {direction}\n"
+        f"Price: {price}\n"
+        f"Reason: {reason}\n"
     )
 
     ok, info = send_telegram(msg)
-    return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
+    return jsonify({"ok": ok, "info": info, "received": payload}), (200 if ok else 500)
 
-@app.post("/webhook")
+
+@app.route("/webhook", methods=["GET", "POST"], strict_slashes=False)
 def webhook():
+    # ✅ لو فتحت الرابط بالمتصفح
+    if request.method == "GET":
+        return jsonify({"ok": True, "info": "webhook is alive"}), 200
+
+    # ✅ لو جاء POST
     payload = request.get_json(silent=True) or {}
+
+    # بعض الأدوات ترسل نص بدل JSON
+    if not payload and request.data:
+        try:
+            payload = request.get_json(force=True) or {}
+        except Exception:
+            payload = {}
+
+    # ✅ إثبات وصول الطلب في Render Logs
+    print("=== WEBHOOK HIT ===")
+    print(payload)
+
     return handle_tradingview(payload)
 
-@app.post("/tv")
+
+@app.route("/tv", methods=["GET", "POST"], strict_slashes=False)
 def tv():
-    payload = request.get_json(silent=True) or {}
-    return handle_tradingview(payload)
+    # Alias لنفس webhook
+    return webhook()
 
 # ============ Scanner (/scan) ============
 @app.get("/scan")
