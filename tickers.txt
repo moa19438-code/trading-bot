@@ -1,0 +1,23 @@
+# Mega + Large
+AAPL
+MSFT
+NVDA
+AMZN
+TSLA
+META
+GOOGL
+AMD
+NFLX
+INTC
+
+# Popular / liquid
+PLTR
+SOFI
+RIVN
+NIO
+LCID
+SNAP
+F
+BAC
+JPM
+XOM
