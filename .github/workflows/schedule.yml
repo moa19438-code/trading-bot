@@ -1,0 +1,14 @@
+name: Daily Scan
+
+on:
+  schedule:
+    - cron: "35 15 * * 1-5"  # 15:35 UTC = 18:35 KSA (أيام الأسبوع)
+  workflow_dispatch:
+
+jobs:
+  call-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /run endpoint
+        run: |
+          curl -sS "https://trading-bot-j2g5.onrender.com/run?key=${{ secrets.RUN_KEY }}"
