@@ -5,41 +5,46 @@ import requests
 
 app = Flask(__name__)
 
-# ====== Environment Variables (set in Render) ======
+# ===== Render Env Vars =====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+# حماية تشغيل السكانر (GitHub Actions)
 RUN_KEY = os.getenv("RUN_KEY", "").strip()
 
-# Trading rules
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))   # 3%
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "5"))  # 5%
+# إعدادات الفرص
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))     # 3%
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "5")) # 5%
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "7"))           # 3-7 فرص (نحدد 7 كحد أعلى)
+MIN_PRICE = float(os.getenv("MIN_PRICE", "2"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "300"))
 
-# Daily scan settings
-MIN_RESULTS = int(os.getenv("MIN_RESULTS", "3"))   # send at least 3 if available
-MAX_RESULTS = int(os.getenv("MAX_RESULTS", "7"))   # send max 7
-MIN_PRICE = float(os.getenv("MIN_PRICE", "2"))     # ignore very cheap
-MAX_PRICE = float(os.getenv("MAX_PRICE", "300"))   # ignore very expensive (optional)
-MIN_AVG_VOL = int(os.getenv("MIN_AVG_VOL", "1500000"))  # liquidity filter
-ENABLE_TIME_WINDOW = os.getenv("ENABLE_TIME_WINDOW", "0").strip() == "1"
+# فلترة السيولة (اختياري – ارفعها/خفّضها لاحقًا)
+MIN_AVG_VOL = int(os.getenv("MIN_AVG_VOL", "1500000"))
 
-# Timezone (optional)
+# منع تكرار نفس السهم بنفس اليوم
+_state = {
+    "day_key": None,
+    "sent_symbols": set(),
+}
+
+# Timezone ET (يتعامل مع DST تلقائيًا)
 try:
     import pytz
     ET = pytz.timezone("America/New_York")
 except Exception:
     ET = None
 
-# yfinance scan (optional)
-USE_YFINANCE_SCAN = os.getenv("USE_YFINANCE_SCAN", "1").strip() == "1"
+# yfinance
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-# ====== Helpers ======
+
+# ================= Helpers =================
 def send_telegram(text: str):
-    """Send a Telegram message and return (ok, info)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
 
@@ -56,9 +61,10 @@ def send_telegram(text: str):
 
     return True, "ok"
 
-def within_market_window():
-    """Optional: only allow during US regular session (ET)."""
-    if not ENABLE_TIME_WINDOW or ET is None:
+
+def market_open_now_et() -> bool:
+    # Regular session 09:30–16:00 ET (Mon–Fri)
+    if ET is None:
         return True
     now = datetime.now(ET)
     if now.weekday() >= 5:
@@ -67,56 +73,25 @@ def within_market_window():
     end = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return start <= now <= end
 
+
+def reset_day():
+    if ET is None:
+        dk = datetime.utcnow().strftime("%Y-%m-%d")
+    else:
+        dk = datetime.now(ET).strftime("%Y-%m-%d")
+    if _state["day_key"] != dk:
+        _state["day_key"] = dk
+        _state["sent_symbols"] = set()
+
+
 def calc_levels(entry: float):
     sl = entry * (1 - STOP_LOSS_PCT / 100.0)
     tp = entry * (1 + TAKE_PROFIT_PCT / 100.0)
     return round(sl, 4), round(tp, 4)
 
-# ====== Web endpoints ======
-@app.get("/")
-def home():
-    return "OK"
 
-@app.get("/test")
-def test():
-    ok, info = send_telegram("✅ Test: البوت شغال ويرسل تيليجرام بنجاح")
-    return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
-
-def handle_tradingview(payload: dict):
-    # Secret check
-    if WEBHOOK_SECRET and str(payload.get("secret", "")).strip() != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "bad secret"}), 401
-
-    ticker = payload.get("ticker") or payload.get("symbol") or "UNKNOWN"
-    price = payload.get("price") or payload.get("close") or ""
-    direction = payload.get("direction") or payload.get("action") or "SIGNAL"
-    tf = payload.get("tf") or payload.get("timeframe") or ""
-    reason = payload.get.get("reason") if isinstance(payload, dict) else None
-
-    msg = f"📣 تنبيه TradingView\nالسهم: {ticker}\nالفريم: {tf}\nالاتجاه: {direction}\nالسعر: {price}"
-    if reason:
-        msg += f"\nسبب: {reason}"
-
-    ok, info = send_telegram(msg)
-    return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
-
-@app.post("/tv")
-def tv():
-    payload = request.get_json(silent=True) or {}
-    if not within_market_window():
-        return jsonify({"ok": True, "ignored": "outside_time_window"}), 200
-    return handle_tradingview(payload)
-
-@app.post("/webhook")
-def webhook():
-    payload = request.get_json(silent=True) or {}
-    if not within_market_window():
-        return jsonify({"ok": True, "ignored": "outside_time_window"}), 200
-    return handle_tradingview(payload)
-
-# ====== Daily scanner ======
 def load_universe():
-    """Load tickers from tickers.txt."""
+    # tickers.txt في نفس الريبو
     path = os.path.join(os.path.dirname(__file__), "tickers.txt")
     tickers = []
     try:
@@ -127,26 +102,30 @@ def load_universe():
                     tickers.append(t)
     except Exception:
         pass
-    return list(dict.fromkeys(tickers))  # unique preserve order
+    # unique
+    return list(dict.fromkeys(tickers))
 
-def scan_market_yfinance(tickers):
+
+def scan_universe(tickers):
     """
-    Practical scan: not literally 'whole US market' (that needs paid data),
-    but scans a large universe list and selects best 3–7 based on momentum + liquidity.
+    سكانر بسيط وعملي:
+    - يستخدم yfinance لجلب بيانات يومية سريعة (آخر يومين) + متوسط فوليوم 20 يوم
+    - يرتّب حسب (ارتفاع يومي + سيولة)
+    ملاحظة: هذا ليس "كل السوق حرفيًا" لكنه يغطي قائمة كبيرة تحددها في tickers.txt
     """
     if yf is None:
         return [], "yfinance not installed"
 
     results = []
-    # We fetch in chunks to reduce failures
-    chunk_size = 50
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i+chunk_size]
-        # Download last 5 days daily data
+
+    # نخليها دفعات لتقليل الأعطال
+    chunk = 60
+    for i in range(0, len(tickers), chunk):
+        group = tickers[i:i+chunk]
         try:
             df = yf.download(
-                tickers=" ".join(chunk),
-                period="5d",
+                tickers=" ".join(group),
+                period="1mo",
                 interval="1d",
                 group_by="ticker",
                 auto_adjust=True,
@@ -156,37 +135,36 @@ def scan_market_yfinance(tickers):
         except Exception:
             continue
 
-        for t in chunk:
+        for sym in group:
             try:
-                # yfinance format differs for single vs multi ticker
-                if isinstance(df.columns, type(getattr(df, "columns", None))) and "Close" in df.columns:
-                    # single ticker fallback
+                # التعامل مع multi-index
+                if "Close" in df.columns:
                     closes = df["Close"].dropna()
                     vols = df["Volume"].dropna()
                 else:
-                    closes = df[(t, "Close")].dropna()
-                    vols = df[(t, "Volume")].dropna()
+                    closes = df[(sym, "Close")].dropna()
+                    vols = df[(sym, "Volume")].dropna()
 
-                if len(closes) < 2 or len(vols) < 2:
+                if len(closes) < 2 or len(vols) < 5:
                     continue
 
                 last = float(closes.iloc[-1])
                 prev = float(closes.iloc[-2])
                 chg_pct = ((last - prev) / prev) * 100.0
-
-                avg_vol = int(vols.tail(5).mean())
+                avg_vol = int(vols.tail(20).mean())
 
                 if last < MIN_PRICE or last > MAX_PRICE:
                     continue
                 if avg_vol < MIN_AVG_VOL:
                     continue
 
-                # Score: daily change + log(volume) influence
-                score = chg_pct + (avg_vol / 10_000_000)  # simple
+                # Score بسيط: ارتفاع يومي + عامل سيولة
+                score = chg_pct + (avg_vol / 10_000_000)
 
                 sl, tp = calc_levels(last)
+
                 results.append({
-                    "ticker": t,
+                    "symbol": sym,
                     "entry": round(last, 4),
                     "sl": sl,
                     "tp": tp,
@@ -197,56 +175,100 @@ def scan_market_yfinance(tickers):
             except Exception:
                 continue
 
-    # Sort by score desc
     results.sort(key=lambda x: x["score"], reverse=True)
     return results, "ok"
 
-@app.get("/run")
-def run_daily():
-    # Protect endpoint
+
+# ================= Endpoints =================
+@app.get("/")
+def home():
+    return "OK"
+
+
+@app.get("/test")
+def test():
+    ok, info = send_telegram("✅ Test: البوت شغال ويرسل تيليجرام بنجاح")
+    return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
+
+
+# TradingView webhooks (/webhook و /tv)
+def handle_tradingview(payload: dict):
+    if WEBHOOK_SECRET and str(payload.get("secret", "")).strip() != WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "bad secret"}), 401
+
+    ticker = payload.get("ticker") or payload.get("symbol") or "UNKNOWN"
+    price = payload.get("price") or payload.get("close") or ""
+    direction = payload.get("direction") or payload.get("action") or "SIGNAL"
+    tf = payload.get("tf") or payload.get("timeframe") or ""
+
+    msg = f"📣 تنبيه TradingView\nالسهم: {ticker}\nالفريم: {tf}\nالاتجاه: {direction}\nالسعر: {price}"
+    ok, info = send_telegram(msg)
+    return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
+
+
+@app.post("/webhook")
+def webhook():
+    payload = request.get_json(silent=True) or {}
+    return handle_tradingview(payload)
+
+
+@app.post("/tv")
+def tv():
+    payload = request.get_json(silent=True) or {}
+    return handle_tradingview(payload)
+
+
+# السكانر اللحظي: GitHub Actions يناديه كل 5 دقائق
+@app.get("/scan")
+def scan():
+    # حماية
     key = request.args.get("key", "").strip()
     if not RUN_KEY or key != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # Optional: run only in market window (you can disable)
-    # if not within_market_window(): ...
+    reset_day()
+
+    # يشتغل فقط وقت السوق الأمريكي (يتعامل مع التوقيت الصيفي تلقائياً)
+    if not market_open_now_et():
+        return jsonify({"ok": True, "ignored": "market_closed"}), 200
 
     universe = load_universe()
     if not universe:
-        ok, info = send_telegram("⚠️ ما لقيت tickers.txt أو القائمة فاضية.")
+        ok, info = send_telegram("⚠️ ملف tickers.txt غير موجود أو فاضي.")
         return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
 
-    if not USE_YFINANCE_SCAN:
-        ok, info = send_telegram("ℹ️ الفحص (scan) مقفّل. فعّل USE_YFINANCE_SCAN=1.")
-        return jsonify({"ok": ok, "info": info}), (200 if ok else 500)
-
-    picks, status = scan_market_yfinance(universe)
-
+    picks, status = scan_universe(universe)
     if not picks:
-        ok, info = send_telegram("📉 اليوم ما فيه فرص مناسبة حسب الفلاتر الحالية.")
-        return jsonify({"ok": ok, "info": info, "status": status}), (200 if ok else 500)
+        return jsonify({"ok": True, "status": status, "message": "no picks"}), 200
 
-    # pick 3–7
-    final = picks[:MAX_RESULTS]
-    if len(final) < MIN_RESULTS:
-        # still send whatever exists
-        pass
+    # خذ أفضل نتائج، وتجنب إعادة إرسال نفس السهم في نفس اليوم
+    fresh = []
+    for p in picks:
+        if p["symbol"] not in _state["sent_symbols"]:
+            fresh.append(p)
+        if len(fresh) >= MAX_RESULTS:
+            break
 
-    # Build message
+    if not fresh:
+        return jsonify({"ok": True, "message": "no new symbols"}), 200
+
+    # أرسل رسالة واحدة فيها 3-7 فرص
     lines = []
-    lines.append("📌 قائمة فرص اليوم (3% وقف / 5% هدف)")
-    lines.append(f"عدد الأسهم المفحوصة: {len(universe)}")
-    lines.append(f"أفضل النتائج: {len(final)}")
+    lines.append("📌 فرص أثناء السوق (SL 3% / TP 5%)")
+    lines.append(f"عدد الفرص: {len(fresh)}")
     lines.append("—")
-
-    for idx, p in enumerate(final, 1):
+    for i, p in enumerate(fresh, 1):
         lines.append(
-            f"{idx}) {p['ticker']} | Δ يومي: {p['chg_pct']}% | AvgVol: {p['avg_vol']}\n"
+            f"{i}) {p['symbol']} | Δ يومي: {p['chg_pct']}% | AvgVol: {p['avg_vol']}\n"
             f"Entry: {p['entry']}\n"
             f"SL (-{STOP_LOSS_PCT}%): {p['sl']}\n"
             f"TP (+{TAKE_PROFIT_PCT}%): {p['tp']}\n"
-            f"—"
+            "—"
         )
 
     ok, info = send_telegram("\n".join(lines))
-    return jsonify({"ok": ok, "info": info, "sent": len(final)}), (200 if ok else 500)
+    if ok:
+        for p in fresh:
+            _state["sent_symbols"].add(p["symbol"])
+
+    return jsonify({"ok": ok, "info": info, "sent": len(fresh)}), (200 if ok else 500)
