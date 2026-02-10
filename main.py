@@ -1,12 +1,13 @@
 import os
+import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
 
 # ===== Telegram control imports =====
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 app = Flask(__name__)
 
@@ -39,10 +40,15 @@ TELEGRAM_BOT_TOKEN = getenv_any(
     ["TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"],
     ""
 )
+
+# قناة/جروب الإشعارات (TradingView + scan)
 TELEGRAM_CHAT_ID = getenv_any(
     ["TELEGRAM_CHAT_ID", "CHAT_ID", "TG_CHAT_ID", "TELEGRAM_USER_ID"],
     ""
 )
+
+# أدمن التحكم من الخاص
+ADMIN_USER_ID = getenv_any(["ADMIN_USER_ID", "TG_ADMIN_ID"], "").strip()
 
 WEBHOOK_SECRET = getenv_any(["WEBHOOK_SECRET", "TV_SECRET", "TRADINGVIEW_SECRET", "SECRET_KEY"], "")
 RUN_KEY = getenv_any(["RUN_KEY", "SCAN_KEY", "CRON_KEY", "JOB_KEY"], "")
@@ -60,6 +66,39 @@ MIN_AVG_VOL = getenv_int_any(["MIN_AVG_VOL", "MIN_VOLUME"], 1_500_000)
 
 _state = {"day_key": None, "sent_symbols": set()}
 
+# Settings persistence (capital, risk, side...)
+DEFAULT_SETTINGS = {
+    "capital": 10000.0,
+    "risk_pct": 1.0,    # %
+    "side": "both"      # long / short / both
+}
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
+_settings_cache = None
+
+def load_settings():
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
+    s = DEFAULT_SETTINGS.copy()
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                s.update(data)
+    except Exception:
+        pass
+    _settings_cache = s
+    return s
+
+def save_settings(s: dict):
+    global _settings_cache
+    _settings_cache = s
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # Timezone ET
 try:
     import pytz
@@ -74,13 +113,21 @@ except Exception:
     yf = None
 
 # ================= Telegram sendMessage =================
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "Missing Telegram env vars"
+def send_telegram(text: str, chat_id: str | None = None):
+    """
+    يرسل للقناة/الجروب الافتراضي TELEGRAM_CHAT_ID.
+    تقدر تمرر chat_id للرد على الخاص مثلًا.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "Missing TELEGRAM_BOT_TOKEN"
+
+    target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+    if not target:
+        return False, "Missing TELEGRAM_CHAT_ID"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+        r = requests.post(url, json={"chat_id": target, "text": text}, timeout=20)
     except Exception as e:
         return False, f"Telegram request failed: {e}"
 
@@ -153,8 +200,7 @@ def scan_universe(tickers):
 
         for sym in group:
             try:
-                # Multi-index vs single
-                if isinstance(df.columns, list) or "Close" in getattr(df, "columns", []):
+                if "Close" in getattr(df, "columns", []):
                     closes = df["Close"].dropna()
                     vols = df["Volume"].dropna()
                 else:
@@ -194,27 +240,74 @@ def scan_universe(tickers):
 
 # ================= Telegram Command Bot (Webhook) =================
 tg_app = None
+_tg_initialized = False
+
+def _ensure_tg_initialized():
+    global _tg_initialized
+    if tg_app and not _tg_initialized:
+        asyncio.run(tg_app.initialize())
+        _tg_initialized = True
+
 if TELEGRAM_BOT_TOKEN:
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-def _chat_allowed(update: Update) -> bool:
+def _is_admin(update: Update) -> bool:
     """
-    لو TELEGRAM_CHAT_ID موجود، نخلي التحكم فقط من نفس الشات.
+    التحكم بالأوامر من الخاص لحساب ADMIN_USER_ID فقط.
     """
-    if not TELEGRAM_CHAT_ID:
-        return True
     try:
-        return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
+        if not ADMIN_USER_ID:
+            return True
+        return str(update.effective_user.id) == str(ADMIN_USER_ID)
     except Exception:
         return False
 
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _chat_allowed(update):
+def _menu():
+    s = load_settings()
+    kb = [
+        [InlineKeyboardButton("📊 Scan الآن", callback_data="scanrun")],
+        [InlineKeyboardButton("💰 Capital +1000", callback_data="cap_plus"),
+         InlineKeyboardButton("💰 Capital -1000", callback_data="cap_minus")],
+        [InlineKeyboardButton("⚠️ Risk +0.25%", callback_data="risk_plus"),
+         InlineKeyboardButton("⚠️ Risk -0.25%", callback_data="risk_minus")],
+        [InlineKeyboardButton("📈 Long", callback_data="side_long"),
+         InlineKeyboardButton("📉 Short", callback_data="side_short"),
+         InlineKeyboardButton("🔁 Both", callback_data="side_both")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="show_settings")]
+    ]
+    text = f"⚙️ Settings\nCapital: {s['capital']}$ | Risk: {s['risk_pct']}% | Side: {s['side']}"
+    return text, InlineKeyboardMarkup(kb)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
         return await update.message.reply_text("⛔ غير مصرح.")
-    await update.message.reply_text("✅ تم. اكتب /scanrun لتشغيل السكان الآن.\nوأوامر الإعدادات: /setsl 3  |  /settp 5")
+    text, markup = _menu()
+    await update.message.reply_text(text, reply_markup=markup)
+
+async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await update.message.reply_text("⛔ غير مصرح.")
+    if not context.args:
+        return await update.message.reply_text("استخدم: /capital 25000")
+    s = load_settings()
+    s["capital"] = float(context.args[0])
+    save_settings(s)
+    text, markup = _menu()
+    await update.message.reply_text(f"✅ تم ضبط رأس المال.\n{text}", reply_markup=markup)
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await update.message.reply_text("⛔ غير مصرح.")
+    if not context.args:
+        return await update.message.reply_text("استخدم: /risk 1.0  (يعني 1%)")
+    s = load_settings()
+    s["risk_pct"] = float(context.args[0])
+    save_settings(s)
+    text, markup = _menu()
+    await update.message.reply_text(f"✅ تم ضبط المخاطرة.\n{text}", reply_markup=markup)
 
 async def cmd_scanrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _chat_allowed(update):
+    if not _is_admin(update):
         return await update.message.reply_text("⛔ غير مصرح.")
 
     reset_day()
@@ -233,31 +326,54 @@ async def cmd_scanrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📈 فرص اليوم (SL {STOP_LOSS_PCT}% | TP {TAKE_PROFIT_PCT}%):"]
     for p in picks[:MAX_RESULTS]:
         lines.append(f"- {p['symbol']} | Entry {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}")
-    await update.message.reply_text("\n".join(lines))
 
-async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global STOP_LOSS_PCT
-    if not _chat_allowed(update):
-        return await update.message.reply_text("⛔ غير مصرح.")
-    if not context.args:
-        return await update.message.reply_text(f"SL الحالي: {STOP_LOSS_PCT}%\nاستخدم: /setsl 3")
-    STOP_LOSS_PCT = float(context.args[0])
-    await update.message.reply_text(f"✅ تم ضبط SL إلى {STOP_LOSS_PCT}%")
+    # نرسل النتائج للقناة
+    ok, info = send_telegram("\n".join(lines))
+    # ونرد عليك بالخاص بتأكيد
+    await update.message.reply_text(f"✅ تم الإرسال للقناة.\n({info})")
 
-async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global TAKE_PROFIT_PCT
-    if not _chat_allowed(update):
-        return await update.message.reply_text("⛔ غير مصرح.")
-    if not context.args:
-        return await update.message.reply_text(f"TP الحالي: {TAKE_PROFIT_PCT}%\nاستخدم: /settp 5")
-    TAKE_PROFIT_PCT = float(context.args[0])
-    await update.message.reply_text(f"✅ تم ضبط TP إلى {TAKE_PROFIT_PCT}%")
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    q = update.callback_query
+    await q.answer()
+
+    s = load_settings()
+    data = q.data
+
+    if data == "scanrun":
+        await q.edit_message_text("⏳ جاري تشغيل السكان... اكتب /scanrun لو تبغى.", reply_markup=_menu()[1])
+        # ملاحظة: تشغيل scanrun الحقيقي يتم بالأمر /scanrun (لتجنب تعقيد async هنا)
+        return
+
+    if data == "cap_plus":
+        s["capital"] = float(s["capital"]) + 1000.0
+    elif data == "cap_minus":
+        s["capital"] = max(0.0, float(s["capital"]) - 1000.0)
+    elif data == "risk_plus":
+        s["risk_pct"] = round(float(s["risk_pct"]) + 0.25, 2)
+    elif data == "risk_minus":
+        s["risk_pct"] = round(max(0.0, float(s["risk_pct"]) - 0.25), 2)
+    elif data == "side_long":
+        s["side"] = "long"
+    elif data == "side_short":
+        s["side"] = "short"
+    elif data == "side_both":
+        s["side"] = "both"
+    elif data == "show_settings":
+        text, markup = _menu()
+        return await q.edit_message_text(text, reply_markup=markup)
+
+    save_settings(s)
+    text, markup = _menu()
+    await q.edit_message_text(f"✅ تم التحديث\n{text}", reply_markup=markup)
 
 if tg_app:
-    tg_app.add_handler(CommandHandler("scan", cmd_scan))
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("capital", cmd_capital))
+    tg_app.add_handler(CommandHandler("risk", cmd_risk))
     tg_app.add_handler(CommandHandler("scanrun", cmd_scanrun))
-    tg_app.add_handler(CommandHandler("setsl", cmd_setsl))
-    tg_app.add_handler(CommandHandler("settp", cmd_settp))
+    tg_app.add_handler(CallbackQueryHandler(on_button))
 
 @app.post("/tg")
 def telegram_webhook():
@@ -268,10 +384,10 @@ def telegram_webhook():
     if TELEGRAM_WEBHOOK_SECRET and secret != TELEGRAM_WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 403
 
+    _ensure_tg_initialized()
+
     data = request.get_json(force=True, silent=True) or {}
     update = Update.de_json(data, tg_app.bot)
-
-    # تشغيل async بشكل آمن داخل Flask
     asyncio.run(tg_app.process_update(update))
     return jsonify({"ok": True})
 
@@ -308,13 +424,6 @@ def handle_tradingview(payload: dict):
         f"الاتجاه: {direction}\n"
         f"السعر: {price}\n"
         f"السبب: {reason}\n"
-        "—\n"
-        "📣 TradingView Alert\n"
-        f"Ticker: {ticker}\n"
-        f"TF: {tf}\n"
-        f"Direction: {direction}\n"
-        f"Price: {price}\n"
-        f"Reason: {reason}\n"
     )
 
     ok, info = send_telegram(msg)
