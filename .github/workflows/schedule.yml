@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Call /run endpoint
         run: |
-          curl -sS "https://trading-bot-j2g5.onrender.com/run?key=${{ secrets.RUN_KEY }}"
+          curl -sS "https://trading-bot-1-2kl8.onrender.com/scan?key=${{ secrets.RUN_KEY }}"
