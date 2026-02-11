@@ -223,22 +223,82 @@ def compute_position_size(capital, risk_pct, entry, sl):
         return 0
     return max(int(risk_dollars / per_share), 0)
 
-def analyze_symbol(symbol: str):
-    if yf is None:
-        return {"ok": False, "error": "yfinance not installed"}
+# ====== NEW: Symbol normalize + Yahoo Chart fallback ======
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    if s in ("SPX", "SP500", "S&P500"):
+        return "^GSPC"
+    if s in ("NDX", "NASDAQ100"):
+        return "^NDX"
+    if s in ("DJI", "DOW"):
+        return "^DJI"
+    return s
 
-    symbol = symbol.strip().upper()
+def fetch_history_yahoo_chart(symbol: str, range_="6mo", interval="1d"):
+    symbol = normalize_symbol(symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": range_, "interval": interval, "includePrePost": "false"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
+    }
+
     try:
-        df = yf.download(symbol, period="6mo", interval="1d", auto_adjust=True, progress=False)
+        r = requests.get(url, params=params, headers=headers, timeout=25)
     except Exception as e:
-        return {"ok": False, "error": f"download failed: {e}"}
+        return {"ok": False, "error": f"chart request failed: {e}"}
 
-    if df is None or df.empty or len(df) < 60:
-        return {"ok": False, "error": "not enough data"}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"chart http {r.status_code}: {r.text[:200]}"}
 
-    closes = [float(x) for x in df["Close"].dropna().tolist()]
-    highs  = [float(x) for x in df["High"].dropna().tolist()]
-    lows   = [float(x) for x in df["Low"].dropna().tolist()]
+    try:
+        data = r.json()
+    except Exception:
+        return {"ok": False, "error": "chart bad json"}
+
+    try:
+        result = data["chart"]["result"][0]
+        quote = result["indicators"]["quote"][0]
+        closes = [float(x) for x in quote.get("close", []) if x is not None]
+        highs  = [float(x) for x in quote.get("high", []) if x is not None]
+        lows   = [float(x) for x in quote.get("low", []) if x is not None]
+    except Exception:
+        return {"ok": False, "error": "chart parse failed"}
+
+    if len(closes) < 60 or len(highs) < 60 or len(lows) < 60:
+        return {"ok": False, "error": f"chart not enough data (closes={len(closes)})"}
+
+    return {"ok": True, "closes": closes, "highs": highs, "lows": lows, "symbol": symbol}
+
+# ====== UPDATED: analyze_symbol uses yfinance then fallback ======
+def analyze_symbol(symbol: str):
+    symbol = normalize_symbol(symbol)
+
+    closes = highs = lows = None
+    used_source = ""
+
+    # 1) try yfinance
+    if yf is not None:
+        try:
+            df = yf.download(symbol, period="6mo", interval="1d", auto_adjust=True, progress=False)
+            if df is not None and (not df.empty) and len(df) >= 60:
+                closes = [float(x) for x in df["Close"].dropna().tolist()]
+                highs  = [float(x) for x in df["High"].dropna().tolist()]
+                lows   = [float(x) for x in df["Low"].dropna().tolist()]
+                if len(closes) >= 60 and len(highs) >= 60 and len(lows) >= 60:
+                    used_source = "yfinance"
+        except Exception:
+            pass
+
+    # 2) fallback to yahoo chart API
+    if closes is None:
+        ch = fetch_history_yahoo_chart(symbol, range_="6mo", interval="1d")
+        if not ch.get("ok"):
+            return {"ok": False, "error": ch.get("error", "not enough data")}
+        closes, highs, lows = ch["closes"], ch["highs"], ch["lows"]
+        symbol = ch.get("symbol", symbol)
+        used_source = "yahoo_chart"
 
     entry = closes[-1]
     ma20 = sma(closes, 20)
@@ -260,6 +320,7 @@ def analyze_symbol(symbol: str):
     risk_pct = float(s.get("risk_pct", 1.0))
     side = str(s.get("side", "both")).lower()
 
+    # Swing ATR multipliers
     sl_mult = 1.5
     tp1_mult = 1.5
     tp2_mult = 3.0
@@ -337,6 +398,7 @@ def analyze_symbol(symbol: str):
     return {
         "ok": True,
         "symbol": symbol,
+        "source": used_source,
         "entry": entry,
         "trend": trend,
         "ma20": ma20,
@@ -413,7 +475,7 @@ def scan_universe(tickers):
 tg_app = None
 _tg_initialized = False
 
-# in-memory cooldown map { "AAPL|BUY": iso_datetime }
+# in-memory cooldown map
 _last_alert_ts = {}
 
 def _ensure_tg_initialized():
@@ -547,6 +609,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = load_settings()
     lines = []
     lines.append(f"🧠 Analyze {res['symbol']} (Swing)")
+    lines.append(f"Source: {res.get('source','?')}")
     lines.append(f"Entry: {res['entry']:.2f}")
     lines.append(f"Trend: {res['trend']} | MA20 {res['ma20']:.2f} | MA50 {res['ma50']:.2f}")
     lines.append(f"RSI(14): {res['rsi']:.1f} | ATR(14): {res['atr']:.2f}")
@@ -674,22 +737,16 @@ def handle_tradingview(payload: dict):
     reason = payload.get("reason") or payload.get("message") or payload.get("r") or "TV Alert"
 
     # ---- Pro filter (analyze + cooldown) ----
-    # Normalize direction
     dir_norm = str(direction).upper()
     if dir_norm in ("BUY", "LONG"):
         dir_norm = "BUY"
     elif dir_norm in ("SELL", "SHORT"):
         dir_norm = "SELL"
-    else:
-        # keep SIGNAL
-        dir_norm = dir_norm
 
-    # cooldown (only for BUY/SELL)
     if dir_norm in ("BUY", "SELL"):
         if not _cooldown_ok(ticker, dir_norm):
             return jsonify({"ok": True, "ignored": "cooldown"}), 200
 
-    # analyze and decide (only for BUY/SELL)
     s = load_settings()
     filter_mode = s.get("filter_mode", "enter_only")
 
@@ -697,13 +754,11 @@ def handle_tradingview(payload: dict):
     if dir_norm in ("BUY", "SELL"):
         res = analyze_symbol(ticker)
         if res.get("ok"):
-            # choose idea based on BUY/SELL
             want_side = "LONG" if dir_norm == "BUY" else "SHORT"
             idea = next((x for x in res["ideas"] if x["side"] == want_side), None)
             if idea:
                 decision_note = f"{idea['decision']} | Score {idea['score']}/8 | SL {idea['sl']:.2f} TP1 {idea['tp1']:.2f} TP2 {idea['tp2']:.2f} Qty {idea['qty']}"
                 if filter_mode == "enter_only" and idea["decision"] != "ENTER":
-                    # don't spam channel, but tell admin in private
                     send_telegram(
                         f"⛔ Filtered TV Alert ({want_side})\n{ticker} {tf}\nDecision: {idea['decision']}\n{decision_note}\nReason: {reason}",
                         chat_id=ADMIN_USER_ID if ADMIN_USER_ID else None
@@ -717,7 +772,6 @@ def handle_tradingview(payload: dict):
                     )
                     return jsonify({"ok": True, "filtered": "SKIP"}), 200
 
-    # ---- Send to channel ----
     msg = (
         "📣 TradingView Alert\n"
         f"Ticker: {ticker}\n"
